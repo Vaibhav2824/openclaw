@@ -1,0 +1,2 @@
+184
+# #201571: required real PostgreSQL payload-byte/sequence-gap/ACK-reject-cancel regressions and opt-in production-worker/CLI proof under the unchanged 512/16 MB limits. The scale sink keeps only incremental hashes/counts; the CLI checks persisted PostgreSQL sources/chunks and head/tail recall.

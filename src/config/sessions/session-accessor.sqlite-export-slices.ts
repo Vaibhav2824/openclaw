@@ -1,4 +1,5 @@
 import { iterateSqliteQuerySync } from "../../infra/kysely-sync.js";
+import { isPostgresSqlConnection } from "../../infra/sql-connection.js";
 import type { OpenClawAgentDatabaseReadOnlyResult } from "../../state/openclaw-agent-db-readonly-open.js";
 import type { OpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
 import type { TranscriptEvent } from "./session-accessor.sqlite-contract.js";
@@ -166,21 +167,40 @@ function readTranscriptPayloadSlice(
 ): TranscriptPayloadSlice {
   return readHotSessionTranscriptSnapshot(database, sessionId, "events", () => {
     const slice: TranscriptPayloadSlice = { payloads: [] };
+    const rows = getSessionKysely(database.db)
+      .selectFrom("transcript_events")
+      .where("session_id", "=", sessionId)
+      .where("seq", "<=", throughSeq)
+      .$if(afterSeq !== undefined, (query) => query.where("seq", ">", afterSeq!))
+      .orderBy("seq", "asc")
+      .limit(TRANSCRIPT_PAYLOAD_SLICE_ROWS);
+    let payloadQuery = rows
+      .select(["seq", "event_json", "event_zstd", "event_utf8_bytes"])
+      .select(transcriptEventReadBytesSql().as("payload_bytes"));
+    if (isPostgresSqlConnection(database.db)) {
+      // PostgreSQL buffers each result before iteration. Choose the byte-budgeted prefix
+      // from bounded scalar metadata before transferring its payload in this same snapshot.
+      let pageEnd: number | undefined;
+      let pageBytes = 0;
+      for (const row of iterateSqliteQuerySync(
+        database.db,
+        rows.select("seq").select(transcriptEventReadBytesSql().as("payload_bytes")),
+      )) {
+        pageEnd = row.seq;
+        pageBytes += row.payload_bytes;
+        if (pageBytes >= TRANSCRIPT_PAYLOAD_SLICE_BYTES) {
+          break;
+        }
+      }
+      if (pageEnd === undefined) {
+        return slice;
+      }
+      payloadQuery = payloadQuery.where("seq", "<=", pageEnd);
+    }
     let bytes = 0;
     let lastSeq: number | undefined;
     // Leaving the loop early or by a throw closes the iterator; no live cursor escapes a read.
-    for (const row of iterateSqliteQuerySync(
-      database.db,
-      getSessionKysely(database.db)
-        .selectFrom("transcript_events")
-        .select(["seq", "event_json", "event_zstd", "event_utf8_bytes"])
-        .select(transcriptEventReadBytesSql().as("payload_bytes"))
-        .where("session_id", "=", sessionId)
-        .where("seq", "<=", throughSeq)
-        .$if(afterSeq !== undefined, (query) => query.where("seq", ">", afterSeq!))
-        .orderBy("seq", "asc")
-        .limit(TRANSCRIPT_PAYLOAD_SLICE_ROWS),
-    )) {
+    for (const row of iterateSqliteQuerySync(database.db, payloadQuery)) {
       slice.payloads.push(readTranscriptPayload(row));
       bytes += row.payload_bytes;
       lastSeq = row.seq;
